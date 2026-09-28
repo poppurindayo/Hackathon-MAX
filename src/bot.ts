@@ -1,18 +1,23 @@
-// TODO:    2GIS запросы по рубрикам
-//          БД, чтобы сохранялась геолокация и userID, а не сбрасывалась постоянно
-//          Раздел 'Посещенные места'
-//          Настройка радиуса зоны поиска
-//          Очистка посещенных мест
-//          
-
+// TODO:
+//   [ ] Запросы к 2GIS по рубрикам: rubric_id = rubrics[key],
+//       point = `${lon},${lat}`, radius = getRadius(uid)
+//   [ ] Вывод результатов списком с кнопкой «Назад» -> nav:wheretogo
+//   [ ] После поиска: logSearch, фильтр по getKnownPlaceIds, recordShown
+//   [ ] Кнопка «Я был здесь» -> markVisited (без неё «Посещенные места» всегда пусты)
+//   [ ] Категория 'museums': найти rubric_id и добавить в rubrics
+//   [ ] Категория 'random': выбор случайного ключа из rubrics
+//   [ ] Обработка ошибок 2GIS (таймаут, пустая выдача, неверный ключ)
+//   [ ] Предпочтения: getTopCategories для подсказок и сортировки выдачи
+//   [ ] Решить, должна ли «Очистка истории» удалять и места со статусом 'shown'
+//   [ ] README: запуск, переменные .env (BOT_TOKEN, TWOGIS_KEY, DB_PATH),
 
 import 'dotenv/config';
 import { Bot, Keyboard, Context } from '@maxhub/max-bot-api';
 import { Update } from '@maxhub/max-bot-api/types';
 import {
-    upsertUser, saveLocation, getLocation, logSearch,
-    getRadius, getVisited, clearVisited, type Location,
-} from './db';
+    upsertUser, saveLocation, getLocation,
+    getRadius, setRadius, getVisited, clearVisited, type Location,
+} from './db.js';
 
 const TWOGIS_KEY = process.env.TWOGIS_KEY;
 const TWOGIS_BASE = 'https://catalog.api.2gis.ru/3.0';
@@ -36,20 +41,19 @@ const rubrics = {
     iceRinks: '11974',          // Катки
 };
 
-// Геолокация с временем сохранения
-type Location = { lat: number; lon: number; ts: number };
-const userLocations = new Map<number, Location>();
+// ГЕОЛОКАЦИЯ
 
 // Через сколько точка считается устаревшей при выборе категории
 const LOCATION_TTL_MS = 30 * 60 * 1000;
 
 function getFreshLocation(uid: number | undefined): Location | undefined {
     if (uid === undefined) return undefined;
-    const loc = userLocations.get(uid);
+    const loc = getLocation(uid);
     if (!loc) return undefined;
     return Date.now() - loc.ts < LOCATION_TTL_MS ? loc : undefined;
 }
 
+// МЕНЮ
 type Page = 'main' | 'wheretogo' | 'settings' | 'geo';
 
 type Button =
@@ -64,7 +68,7 @@ interface PageDef {
 
 const pages: Record<Page, PageDef> = {
     main: {
-        text: 'Title Text',
+        text: 'Главное меню',
         rows: [
             // Геолокацию запрашиваем только при входе отсюда
             [Keyboard.button.callback('Куда пойти', 'nav:geo')],
@@ -113,6 +117,8 @@ function buildKeyboard(page: Page) {
     return Keyboard.inlineKeyboard(all);
 }
 
+
+
 const getUserId = (ctx: Context<Update>): number | undefined => ctx.user?.user_id;
 
 async function editPage(page: Page, ctx: Context<Update>) {
@@ -124,11 +130,11 @@ async function editPage(page: Page, ctx: Context<Update>) {
 const sendPage = (page: Page, ctx: Context<Update>) =>
     ctx.reply(pages[page].text, { attachments: [buildKeyboard(page)] });
 
-// Заглушка «В разработке» с кнопкой «Назад» на нужную страницу
-async function wip(ctx: Context<Update>, backTo: Page) {
+// Текст + 'Назад'
+async function textWithBack(ctx: Context<Update>, text: string, backTo: Page) {
     await ctx.answerOnCallback({
         message: {
-            text: 'В разработке',
+            text,
             attachments: [
                 Keyboard.inlineKeyboard([
                     [Keyboard.button.callback('Назад', `nav:${backTo}`)],
@@ -138,7 +144,39 @@ async function wip(ctx: Context<Update>, backTo: Page) {
     });
 }
 
-// Бот
+const wip = (ctx: Context<Update>, backTo: Page) => textWithBack(ctx, 'В разработке', backTo);
+
+// РАДИУС ПОИСКА
+
+const RADIUS_OPTIONS = [1000, 3000, 5000, 10000];
+const formatRadius = (m: number) => `${m / 1000} км`;
+
+async function showRadius(ctx: Context<Update>) {
+    const uid = getUserId(ctx);
+    const current = uid === undefined ? undefined : getRadius(uid);
+
+    const options = RADIUS_OPTIONS.map((m) =>
+        Keyboard.button.callback(
+            `${m === current ? '✓ ' : ''}${formatRadius(m)}`,
+            `radius:${m}`,
+        ),
+    );
+
+    await ctx.answerOnCallback({
+        message: {
+            text: `Радиус поиска: ${current ? formatRadius(current) : '—'}\nВыберите новый:`,
+            attachments: [
+                Keyboard.inlineKeyboard([
+                    options.slice(0, 2),
+                    options.slice(2),
+                    [Keyboard.button.callback('Назад', 'nav:settings')],
+                ]),
+            ],
+        },
+    });
+}
+
+// БОТ
 const bot = new Bot(process.env.BOT_TOKEN || '');
 bot.api.setMyCommands([{
     name: 'start',
@@ -156,9 +194,16 @@ bot.use(async (ctx, next) => {
     }
     return next();
 });
- 
-bot.on('bot_started', (ctx) => sendPage('main', ctx));
-bot.command('start', (ctx) => sendPage('main', ctx));
+
+// Приветствие
+const greet = async (ctx: Context<Update>) => {
+    const name = (ctx.user as any)?.first_name;
+    await ctx.reply(name ? `Привет, ${name}!` : 'Привет!');
+    await sendPage('main', ctx);
+};
+
+bot.on('bot_started', greet);
+bot.command('start', greet);
 
 // Навигация
 bot.action(/^nav:(main|wheretogo|settings|geo)$/, async (ctx) => {
@@ -174,7 +219,7 @@ bot.on('message_created', async (ctx) => {
     const uid = getUserId(ctx);
     if (uid === undefined) return;
 
-    userLocations.set(uid, { lat: loc.latitude, lon: loc.longitude, ts: Date.now() });
+    saveLocation(uid, loc.latitude, loc.longitude);
     await sendPage('wheretogo', ctx);
 });
 
@@ -183,7 +228,8 @@ bot.action(/^cat:(\w+)$/, async (ctx) => {
     const location = getFreshLocation(getUserId(ctx));
     if (!location) return editPage('geo', ctx);
 
-    // TODO: Запрос к 2GIS: rubric_id = rubrics[key], point = `${location.lon},${location.lat}`
+    // TODO: Запрос к 2GIS: rubric_id = rubrics[key], point = `${location.lon},${location.lat}`,
+    // radius = getRadius(uid); затем logSearch, фильтр по getKnownPlaceIds, recordShown
     await wip(ctx, 'wheretogo');
 });
 
@@ -191,13 +237,13 @@ bot.action(/^cat:(\w+)$/, async (ctx) => {
 bot.action('visited_places', async (ctx) => {
     const uid = getUserId(ctx);
     const visited = uid === undefined ? [] : getVisited(uid, 10);
- 
+
     const text = visited.length === 0
         ? 'Вы пока нигде не отметились'
         : 'Посещённые места:\n\n' + visited
             .map((p, i) => `${i + 1}. ${p.name}${p.address ? ` — ${p.address}` : ''}`)
             .join('\n');
- 
+
     await textWithBack(ctx, text, 'main');
 });
  
@@ -208,9 +254,17 @@ bot.action('clear_visited_places', async (ctx) => {
     await textWithBack(ctx, n > 0 ? `История очищена (удалено мест: ${n})` : 'История уже пуста', 'settings');
 });
 
-// Остальные разделы в разработке
-bot.action('visited_places', (ctx) => wip(ctx, 'main'));
-bot.action(/^(search_area|clear_visited_places)$/, (ctx) => wip(ctx, 'settings'));
+// Радиус поиска
+bot.action('search_area', showRadius);
+
+bot.action(/^radius:(\d+)$/, async (ctx) => {
+    const uid = getUserId(ctx);
+    const value = Number(ctx.match![1]);
+    if (uid !== undefined && RADIUS_OPTIONS.includes(value)) {
+        setRadius(uid, value);
+    }
+    await showRadius(ctx);
+});
 
 bot.start().catch((err) => {
     console.error('Не удалось запустить бота:', err);
