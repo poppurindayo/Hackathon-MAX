@@ -9,6 +9,10 @@
 import 'dotenv/config';
 import { Bot, Keyboard, Context } from '@maxhub/max-bot-api';
 import { Update } from '@maxhub/max-bot-api/types';
+import {
+    upsertUser, saveLocation, getLocation, logSearch,
+    getRadius, getVisited, clearVisited, type Location,
+} from './db';
 
 const TWOGIS_KEY = process.env.TWOGIS_KEY;
 const TWOGIS_BASE = 'https://catalog.api.2gis.ru/3.0';
@@ -144,6 +148,18 @@ bot.api.setMyCommands([{
 bot.on('bot_started', (ctx) => sendPage('main', ctx));
 bot.command('start', (ctx) => sendPage('main', ctx));
 
+// Регистрация/обновление пользователя при любом апдейте
+bot.use(async (ctx, next) => {
+    const user: any = ctx.user;
+    if (user?.user_id !== undefined) {
+        upsertUser(user.user_id, { username: user.username, firstName: user.first_name });
+    }
+    return next();
+});
+ 
+bot.on('bot_started', (ctx) => sendPage('main', ctx));
+bot.command('start', (ctx) => sendPage('main', ctx));
+
 // Навигация
 bot.action(/^nav:(main|wheretogo|settings|geo)$/, async (ctx) => {
     await editPage(ctx.match![1] as Page, ctx);
@@ -169,6 +185,27 @@ bot.action(/^cat:(\w+)$/, async (ctx) => {
 
     // TODO: Запрос к 2GIS: rubric_id = rubrics[key], point = `${location.lon},${location.lat}`
     await wip(ctx, 'wheretogo');
+});
+
+// Посещённые места
+bot.action('visited_places', async (ctx) => {
+    const uid = getUserId(ctx);
+    const visited = uid === undefined ? [] : getVisited(uid, 10);
+ 
+    const text = visited.length === 0
+        ? 'Вы пока нигде не отметились'
+        : 'Посещённые места:\n\n' + visited
+            .map((p, i) => `${i + 1}. ${p.name}${p.address ? ` — ${p.address}` : ''}`)
+            .join('\n');
+ 
+    await textWithBack(ctx, text, 'main');
+});
+ 
+// Очистка истории посещённых мест
+bot.action('clear_visited_places', async (ctx) => {
+    const uid = getUserId(ctx);
+    const n = uid === undefined ? 0 : clearVisited(uid);
+    await textWithBack(ctx, n > 0 ? `История очищена (удалено мест: ${n})` : 'История уже пуста', 'settings');
 });
 
 // Остальные разделы в разработке
