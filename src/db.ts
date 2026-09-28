@@ -10,8 +10,6 @@ db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
 // ───────────────────────── Миграции ─────────────────────────
-// Новые изменения схемы = новый элемент в конец массива.
-// Уже применённые миграции повторно не запускаются (PRAGMA user_version).
 const MIGRATIONS: string[] = [
     `
     CREATE TABLE users (
@@ -186,6 +184,12 @@ const stmtMarkVisited = db.prepare(`
     ON CONFLICT(user_id, place_id) DO UPDATE SET status = 'visited', updated_at = excluded.updated_at
 `);
 
+// Отметка по одному place_id: данные места уже записаны через recordShown
+const stmtMarkVisitedById = db.prepare(`
+    UPDATE user_places SET status = 'visited', updated_at = ?
+    WHERE user_id = ? AND place_id = ?
+`);
+
 const stmtGetVisited = db.prepare(`
     SELECT place_id, name, address, category, updated_at FROM user_places
     WHERE user_id = ? AND status = 'visited'
@@ -209,6 +213,11 @@ export function markVisited(userId: number, p: PlaceInput) {
         userId, placeId: p.placeId, name: p.name,
         address: p.address ?? null, category: p.category ?? null, now: Date.now(),
     });
+}
+
+/** Возвращает true, если место найдено среди показанных этому пользователю. */
+export function markVisitedById(userId: number, placeId: string): boolean {
+    return stmtMarkVisitedById.run(Date.now(), userId, placeId).changes > 0;
 }
 
 export function getVisited(userId: number, limit = 10, offset = 0) {
