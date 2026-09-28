@@ -4,7 +4,7 @@
 //   [ ] Вывод результатов списком с кнопкой «Назад» -> nav:wheretogo
 //   [ ] После поиска: logSearch, фильтр по getKnownPlaceIds, recordShown
 //   [ ] Кнопка «Я был здесь» -> markVisited (без неё «Посещенные места» всегда пусты)
-//   [ ] Категория 'museums': найти rubric_id и добавить в rubrics
+//   [ ] Сделать правильное отображение рубрик в меню (не все)
 //   [ ] Категория 'random': выбор случайного ключа из rubrics
 //   [ ] Обработка ошибок 2GIS (таймаут, пустая выдача, неверный ключ)
 //   [ ] Предпочтения: getTopCategories для подсказок и сортировки выдачи
@@ -16,12 +16,15 @@ import { Bot, Keyboard, Context } from '@maxhub/max-bot-api';
 import { Update } from '@maxhub/max-bot-api/types';
 import {
     upsertUser, saveLocation, getLocation,
-    getRadius, setRadius, getVisited, clearVisited, type Location,
+    getRadius, setRadius, getVisited, clearVisited,
+    logSearch, recordShown, getKnownPlaceIds, markVisitedById,
+    type Location, type PlaceInput,
 } from './db.js';
 
 const TWOGIS_KEY = process.env.TWOGIS_KEY;
 const TWOGIS_BASE = 'https://catalog.api.2gis.ru/3.0';
 
+// id рубрик из API 2GIS
 const rubrics = {
     // Досуг (parent_id = 2)
     cinema: '192',              // Кинотеатры
@@ -41,6 +44,34 @@ const rubrics = {
     iceRinks: '11974',          // Катки
 };
 
+type RubricKey = keyof typeof rubrics;
+const rubricKeys = Object.keys(rubrics) as RubricKey[];
+const isRubricKey = (k: string): k is RubricKey => k in rubrics;
+
+// Подписи кнопок (ключи должны совпадать с rubrics)
+const categoryLabels: Record<RubricKey, string> = {
+    cinema: 'Кино',
+    theatre: 'Театры и концерты',
+    parks: 'Парки',
+    attractions: 'Аттракционы',
+    quests: 'Квесты',
+    fitness: 'Фитнес-клубы',
+    pools: 'Бассейны',
+    sportSections: 'Спортивные секции',
+    sportSchools: 'Спортивные школы',
+    stadiums: 'Стадионы',
+    skateparks: 'Скейт-парки',
+    rollerdromes: 'Роллердромы',
+    iceRinks: 'Катки',
+};
+
+// Группы для подменю
+const leisureKeys: RubricKey[] = ['cinema', 'theatre', 'parks', 'attractions', 'quests'];
+const sportKeys: RubricKey[] = [
+    'fitness', 'pools', 'sportSections', 'sportSchools',
+    'stadiums', 'skateparks', 'rollerdromes', 'iceRinks',
+];
+
 // ГЕОЛОКАЦИЯ
 
 // Через сколько точка считается устаревшей при выборе категории
@@ -54,7 +85,7 @@ function getFreshLocation(uid: number | undefined): Location | undefined {
 }
 
 // МЕНЮ
-type Page = 'main' | 'wheretogo' | 'settings' | 'geo';
+type Page = 'main' | 'wheretogo' | 'leisure' | 'sport' | 'settings' | 'geo';
 
 type Button =
     | ReturnType<typeof Keyboard.button.callback>
@@ -64,6 +95,13 @@ interface PageDef {
     text: string;
     parent?: Page;
     rows: Button[][];
+}
+
+function categoryRows(keys: RubricKey[]): Button[][] {
+    const buttons = keys.map((k) => Keyboard.button.callback(categoryLabels[k], `cat:${k}`));
+    const rows: Button[][] = [];
+    for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+    return rows;
 }
 
 const pages: Record<Page, PageDef> = {
@@ -84,20 +122,23 @@ const pages: Record<Page, PageDef> = {
         ],
     },
     wheretogo: {
-        text: 'Пожалуйста, выберите категорию',
+        text: 'Пожалуйста, выберите раздел',
         parent: 'main',
         rows: [
-            [Keyboard.button.callback('Кино', 'cat:cinema'),
-             Keyboard.button.callback('Театр', 'cat:theatre')],
-
-            [Keyboard.button.callback('Музеи', 'cat:museums'),
-             Keyboard.button.callback('Парки', 'cat:parks')],
-
-            [Keyboard.button.callback('Спортивные секции', 'cat:sportSections'),
-             Keyboard.button.callback('Спортивные площадки', 'cat:stadiums')],
-
+            [Keyboard.button.callback('Досуг', 'nav:leisure')],
+            [Keyboard.button.callback('Спорт и активный отдых', 'nav:sport')],
             [Keyboard.button.callback('Случайно', 'cat:random')],
         ],
+    },
+    leisure: {
+        text: 'Досуг: выберите категорию',
+        parent: 'wheretogo',
+        rows: categoryRows(leisureKeys),
+    },
+    sport: {
+        text: 'Спорт и активный отдых: выберите категорию',
+        parent: 'wheretogo',
+        rows: categoryRows(sportKeys),
     },
     settings: {
         text: 'Настройки',
@@ -117,7 +158,7 @@ function buildKeyboard(page: Page) {
     return Keyboard.inlineKeyboard(all);
 }
 
-
+// ХЕЛПЕРЫ
 
 const getUserId = (ctx: Context<Update>): number | undefined => ctx.user?.user_id;
 
@@ -143,8 +184,6 @@ async function textWithBack(ctx: Context<Update>, text: string, backTo: Page) {
         },
     });
 }
-
-const wip = (ctx: Context<Update>, backTo: Page) => textWithBack(ctx, 'В разработке', backTo);
 
 // РАДИУС ПОИСКА
 
@@ -174,6 +213,49 @@ async function showRadius(ctx: Context<Update>) {
             ],
         },
     });
+}
+
+// 2GIS
+async function searchPlaces(key: RubricKey, loc: Location, radiusM: number): Promise<PlaceInput[]> {
+    const url = new URL(`${TWOGIS_BASE}/items`);
+    url.searchParams.set('key', TWOGIS_KEY ?? '');
+    url.searchParams.set('rubric_id', rubrics[key]);
+    url.searchParams.set('point', `${loc.lon},${loc.lat}`);
+    url.searchParams.set('radius', String(radiusM));
+    url.searchParams.set('sort', 'distance');
+    url.searchParams.set('type', 'branch');
+    url.searchParams.set('page_size', '10');
+    url.searchParams.set('locale', 'ru_RU');
+
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const data: any = await res.json();
+
+    if (data?.meta?.code === 404) return [];
+    if (data?.meta?.code !== 200) {
+        throw new Error(`2GIS: ${data?.meta?.code} ${data?.meta?.error?.message ?? ''}`);
+    }
+
+    return (data.result?.items ?? []).map((i: any) => ({
+        placeId: String(i.id),
+        name: i.name ?? 'Без названия',
+        address: i.address_name ?? null,
+        category: key,
+    }));
+}
+
+// Очередь найденных мест на пользователя (в памяти, потеря при рестарте не страшна).
+// Кнопка «Другое» берёт следующее место из очереди без нового запроса к 2GIS.
+const queues = new Map<number, { key: RubricKey; places: PlaceInput[] }>();
+
+async function nextPlace(uid: number, key: RubricKey, loc: Location): Promise<PlaceInput | undefined> {
+    let q = queues.get(uid);
+    if (!q || q.key !== key || q.places.length === 0) {
+        const known = getKnownPlaceIds(uid);
+        const found = await searchPlaces(key, loc, getRadius(uid));
+        q = { key, places: found.filter((p) => !known.has(p.placeId)) };
+        queues.set(uid, q);
+    }
+    return q.places.shift();
 }
 
 // БОТ
@@ -206,7 +288,7 @@ bot.on('bot_started', greet);
 bot.command('start', greet);
 
 // Навигация
-bot.action(/^nav:(main|wheretogo|settings|geo)$/, async (ctx) => {
+bot.action(/^nav:(main|wheretogo|leisure|sport|settings|geo)$/, async (ctx) => {
     await editPage(ctx.match![1] as Page, ctx);
 });
 
@@ -220,17 +302,65 @@ bot.on('message_created', async (ctx) => {
     if (uid === undefined) return;
 
     saveLocation(uid, loc.latitude, loc.longitude);
+    queues.delete(uid);
     await sendPage('wheretogo', ctx);
 });
 
-// Категории
+// Категории: показываем по одному месту
 bot.action(/^cat:(\w+)$/, async (ctx) => {
-    const location = getFreshLocation(getUserId(ctx));
-    if (!location) return editPage('geo', ctx);
+    const uid = getUserId(ctx);
+    const location = getFreshLocation(uid);
+    if (uid === undefined || !location) return editPage('geo', ctx);
 
-    // TODO: Запрос к 2GIS: rubric_id = rubrics[key], point = `${location.lon},${location.lat}`,
-    // radius = getRadius(uid); затем logSearch, фильтр по getKnownPlaceIds, recordShown
-    await wip(ctx, 'wheretogo');
+    const raw = ctx.match![1];
+    const key = raw === 'random'
+        ? rubricKeys[Math.floor(Math.random() * rubricKeys.length)]
+        : isRubricKey(raw) ? raw : undefined;
+
+    if (!key) return textWithBack(ctx, 'Неизвестная категория.', 'wheretogo');
+
+    try {
+        const place = await nextPlace(uid, key, location);
+
+        if (!place) {
+            return textWithBack(
+                ctx,
+                'Больше новых мест не нашлось. Попробуйте другую категорию или увеличьте радиус в настройках.',
+                'wheretogo',
+            );
+        }
+
+        recordShown(uid, [place]);
+        logSearch(uid, raw, location.lat, location.lon, getRadius(uid));
+
+        await ctx.answerOnCallback({
+            message: {
+                text: `${place.name}\n${place.address ?? 'Адрес не указан'}`,
+                attachments: [
+                    Keyboard.inlineKeyboard([
+                        [Keyboard.button.link('Открыть в 2GIS', `https://2gis.ru/firm/${place.placeId}`)],
+                        [Keyboard.button.callback('Я был здесь', `visit:${place.placeId}`)],
+                        [Keyboard.button.callback('Другое', `cat:${raw}`)],
+                        [Keyboard.button.callback('Назад', 'nav:wheretogo')],
+                    ]),
+                ],
+            },
+        });
+    } catch (err) {
+        console.error('Ошибка поиска в 2GIS:', err);
+        await textWithBack(ctx, 'Не удалось получить места, попробуйте позже.', 'wheretogo');
+    }
+});
+
+// «Я был здесь»
+bot.action(/^visit:([\w-]+)$/, async (ctx) => {
+    const uid = getUserId(ctx);
+    const ok = uid !== undefined && markVisitedById(uid, ctx.match![1]);
+    await textWithBack(
+        ctx,
+        ok ? 'Отмечено! Место появится в «Посещенных местах».' : 'Не удалось найти это место.',
+        'wheretogo',
+    );
 });
 
 // Посещённые места
@@ -262,6 +392,7 @@ bot.action(/^radius:(\d+)$/, async (ctx) => {
     const value = Number(ctx.match![1]);
     if (uid !== undefined && RADIUS_OPTIONS.includes(value)) {
         setRadius(uid, value);
+        queues.delete(uid);
     }
     await showRadius(ctx);
 });
