@@ -54,6 +54,9 @@ const MIGRATIONS: string[] = [
     );
     CREATE INDEX idx_user_places_status ON user_places(user_id, status, updated_at DESC);
     `,
+    `
+    ALTER TABLE user_places ADD COLUMN rating INTEGER;
+    `,
 ];
 
 function migrate() {
@@ -185,7 +188,8 @@ const stmtMarkVisited = db.prepare(`
     ON CONFLICT(user_id, place_id) DO UPDATE SET status = 'visited', updated_at = excluded.updated_at
 `);
 
-// Оценка мест от 1 до 5 
+// ───────────────────────── Оценки мест ─────────────────────────
+// Оценка места от 1 до 5. Оценивать можно только посещённые места.
 const stmtSetRating = db.prepare(`
     UPDATE user_places
     SET rating = ?, updated_at = ?
@@ -209,7 +213,7 @@ export function setPlaceRating(
     ).changes > 0;
 }
 
-// Чтобы бот использовал оценки пользователей для составления рейтинга понравившихся мест
+// Средняя оценка по категориям — используется для формирования предпочтений пользователя.
 const stmtCategoryRatings = db.prepare(`
     SELECT
         category,
@@ -239,7 +243,7 @@ const stmtMarkVisitedById = db.prepare(`
 `);
 
 const stmtGetVisited = db.prepare(`
-    SELECT place_id, name, address, category, updated_at FROM user_places
+    SELECT place_id, name, address, category, rating, updated_at FROM user_places
     WHERE user_id = ? AND status = 'visited'
     ORDER BY updated_at DESC LIMIT ? OFFSET ?
 `);
