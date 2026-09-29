@@ -120,12 +120,12 @@
 
 | Переменная   | Назначение                          | Пример               |
 | ------------ | ----------------------------------- | -------------------- |
-| `BOT_TOKEN`  | токен MAX-бота                      | `your_max_bot_token` |
+| `BOT_TOKEN`  | Токен MAX-бота                      | `your_max_bot_token` |
 | `TWOGIS_KEY` | API-ключ 2GIS                       | `your_2gis_api_key`  |
-| `DB_PATH`    | путь к SQLite                       | `./data/bot.db`      |
-| `LOG_PATH`   | путь к файлу логов                  | `./logs/bot.log`     |
-| `LOG_LEVEL`  | уровень логирования                 | `info`               |
-| `LOG_SALT`   | Псевдонимизации ID в логах          | `change-me`          |
+| `DB_PATH`    | Путь к SQLite                       | `./data/bot.db`      |
+| `LOG_PATH`   | Путь к файлу логов                  | `./logs/bot.log`     |
+| `LOG_LEVEL`  | Уровень логирования                 | `info`               |
+| `LOG_SALT`   | Псевдонимизация ID в логах          | `change-me`          |
 
 # 6. Зависимости
 
