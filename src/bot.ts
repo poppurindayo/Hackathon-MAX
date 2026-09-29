@@ -642,7 +642,9 @@ bot.action('visited_places', async (ctx) => {
     const text = visited.length === 0
         ? 'Вы пока нигде не отметились'
         : 'Посещённые места:\n\n' + visited
-            .map((p, i) => `${i + 1}. ${p.name}${p.address ? ` — ${p.address}` : ''}`)
+            .map((p, i) =>
+                `${i + 1}. ${p.name}${p.address ? ` — ${p.address}` : ''}${p.rating != null ? ` — ⭐ ${p.rating}/5` : ''}`
+            )
             .join('\n');
 
     await textWithBack(ctx, text, 'main');
