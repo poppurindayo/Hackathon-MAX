@@ -1,7 +1,3 @@
-// TODO:
-//   [ ] Предпочтения: getTopCategories для подсказок и сортировки выдачи
-//   [ ] Решить, должна ли «Очистка истории» удалять и места со статусом 'shown'
-
 import 'dotenv/config';
 import { Bot, Keyboard, Context } from '@maxhub/max-bot-api';
 import { Update } from '@maxhub/max-bot-api/types';
@@ -10,6 +6,7 @@ import {
     upsertUser, saveLocation, getLocation,
     getRadius, setRadius, getVisited, clearVisited,
     logSearch, recordShown, getKnownPlaceIds, markVisitedById,
+    setPlaceRating,
     type Location, type PlaceInput,
 } from './db.js';
 
@@ -577,13 +574,62 @@ bot.action(/^cat:(\w+)$/, async (ctx) => {
     }
 });
 
-// «Kilroy was here» button
+// «Я был здесь» — отмечаем место и предлагаем оценить его
 bot.action(/^visit:([\w-]+)$/, async (ctx) => {
     const uid = getUserId(ctx);
-    const ok = uid !== undefined && markVisitedById(uid, ctx.match![1]);
+    const placeId = ctx.match![1];
+
+    if (uid === undefined) {
+        return textWithBack(ctx, 'Не удалось определить пользователя.', 'wheretogo');
+    }
+
+    const ok = markVisitedById(uid, placeId);
+
+    if (!ok) {
+        return textWithBack(ctx, 'Не удалось найти это место.', 'wheretogo');
+    }
+
+    await ctx.answerOnCallback({
+        message: {
+            text: 'Место отмечено как посещённое.\n\nОцените его от 1 до 5:',
+            attachments: [
+                Keyboard.inlineKeyboard([
+                    [
+                        Keyboard.button.callback('⭐ 1', `rate:${placeId}:1`),
+                        Keyboard.button.callback('⭐ 2', `rate:${placeId}:2`),
+                        Keyboard.button.callback('⭐ 3', `rate:${placeId}:3`),
+                    ],
+                    [
+                        Keyboard.button.callback('⭐ 4', `rate:${placeId}:4`),
+                        Keyboard.button.callback('⭐ 5', `rate:${placeId}:5`),
+                    ],
+                    [
+                        Keyboard.button.callback('Пропустить', 'nav:wheretogo'),
+                    ],
+                ]),
+            ],
+        },
+    });
+});
+
+// Сохранение оценки места
+bot.action(/^rate:([\w-]+):([1-5])$/, async (ctx) => {
+    const uid = getUserId(ctx);
+
+    if (uid === undefined) {
+        return textWithBack(ctx, 'Не удалось определить пользователя.', 'wheretogo');
+    }
+
+    const placeId = ctx.match![1];
+    const rating = Number(ctx.match![2]);
+
+    const ok = setPlaceRating(uid, placeId, rating);
+
     await textWithBack(
         ctx,
-        ok ? 'Отмечено! Место появится в «Посещенных местах».' : 'Не удалось найти это место.',
+        ok
+            ? `Оценка сохранена: ${rating}/5 ⭐`
+            : 'Не удалось сохранить оценку.',
         'wheretogo',
     );
 });

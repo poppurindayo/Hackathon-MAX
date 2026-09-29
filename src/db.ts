@@ -54,6 +54,9 @@ const MIGRATIONS: string[] = [
     );
     CREATE INDEX idx_user_places_status ON user_places(user_id, status, updated_at DESC);
     `,
+    `
+    ALTER TABLE user_places ADD COLUMN rating INTEGER;
+    `,
 ];
 
 function migrate() {
@@ -82,6 +85,7 @@ export interface VisitedPlace {
     name: string;
     address: string | null;
     category: string | null;
+    rating: number | null;
     updated_at: number;
 }
 
@@ -184,6 +188,54 @@ const stmtMarkVisited = db.prepare(`
     ON CONFLICT(user_id, place_id) DO UPDATE SET status = 'visited', updated_at = excluded.updated_at
 `);
 
+// ───────────────────────── Оценки мест ─────────────────────────
+// Оценка места от 1 до 5. Оценивать можно только посещённые места.
+const stmtSetRating = db.prepare(`
+    UPDATE user_places
+    SET rating = ?, updated_at = ?
+    WHERE user_id = ?
+      AND place_id = ?
+      AND status = 'visited'
+`);
+
+export function setPlaceRating(
+    userId: number,
+    placeId: string,
+    rating: number
+): boolean {
+    if (rating < 1 || rating > 5) return false;
+
+    return stmtSetRating.run(
+        rating,
+        Date.now(),
+        userId,
+        placeId
+    ).changes > 0;
+}
+
+// Средняя оценка по категориям — используется для формирования предпочтений пользователя.
+const stmtCategoryRatings = db.prepare(`
+    SELECT
+        category,
+        AVG(rating) AS avg_rating,
+        COUNT(rating) AS rating_count
+    FROM user_places
+    WHERE user_id = ?
+      AND status = 'visited'
+      AND rating IS NOT NULL
+      AND category IS NOT NULL
+    GROUP BY category
+    ORDER BY avg_rating DESC, rating_count DESC
+`);
+
+export function getCategoryRatings(userId: number) {
+    return stmtCategoryRatings.all(userId) as {
+        category: string;
+        avg_rating: number;
+        rating_count: number;
+    }[];
+}
+
 // Отметка по одному place_id: данные места уже записаны через recordShown
 const stmtMarkVisitedById = db.prepare(`
     UPDATE user_places SET status = 'visited', updated_at = ?
@@ -191,7 +243,7 @@ const stmtMarkVisitedById = db.prepare(`
 `);
 
 const stmtGetVisited = db.prepare(`
-    SELECT place_id, name, address, category, updated_at FROM user_places
+    SELECT place_id, name, address, category, rating, updated_at FROM user_places
     WHERE user_id = ? AND status = 'visited'
     ORDER BY updated_at DESC LIMIT ? OFFSET ?
 `);
