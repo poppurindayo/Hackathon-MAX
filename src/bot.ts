@@ -1,15 +1,18 @@
 // TODO:
+//   [ ] После поиска: logSearch, фильтр по getKnownPlaceIds, recordShown
+//   [ ] Обработка ошибок 2GIS (таймаут, пустая выдача, неверный ключ)
 //   [ ] Предпочтения: getTopCategories для подсказок и сортировки выдачи
 //   [ ] Решить, должна ли «Очистка истории» удалять и места со статусом 'shown'
+//   [ ] README: запуск, переменные .env (BOT_TOKEN, TWOGIS_KEY, DB_PATH),
 
 import 'dotenv/config';
 import { Bot, Keyboard, Context } from '@maxhub/max-bot-api';
 import { Update } from '@maxhub/max-bot-api/types';
-import { logger, getRequestId, getUserLogId, errorInfo, summarizeUpdate } from './logger.js';
 import {
     upsertUser, saveLocation, getLocation,
     getRadius, setRadius, getVisited, clearVisited,
-    logSearch, recordShown, getKnownPlaceIds, markVisitedById,
+    logSearch, recordShown, getKnownPlaceIds, markVisitedById, 
+    setPlaceRating, getCategoryRatings,
     type Location, type PlaceInput,
 } from './db.js';
 
@@ -76,10 +79,6 @@ function getFreshLocation(uid: number | undefined): Location | undefined {
     return Date.now() - loc.ts < LOCATION_TTL_MS ? loc : undefined;
 }
 
-// Пользователи, от которых бот ждёт адрес текстом
-// (запасной вариант, если кнопка геолокации не работает, (В ВЕБЕ НЕ РАБОТАЕТ как я понял) )
-const awaitingAddress = new Set<number>();
-
 // МЕНЮ
 type Page = 'main' | 'wheretogo' | 'leisure' | 'sport' | 'settings' | 'geo';
 
@@ -104,18 +103,17 @@ const pages: Record<Page, PageDef> = {
     main: {
         text: 'Главное меню',
         rows: [
-            // Запрос геолокации
+            // Геолокацию запрашиваем только при входе отсюда
             [Keyboard.button.callback('Куда пойти', 'nav:geo')],
             [Keyboard.button.callback('Посещенные места', 'visited_places')],
             [Keyboard.button.callback('Настройки', 'nav:settings')],
         ],
     },
     geo: {
-        text: 'Чтобы подобрать места рядом, отправьте свою геолокацию или введите адрес вручную',
+        text: 'Чтобы подобрать места рядом, отправьте свою геолокацию',
         parent: 'main',
         rows: [
             [Keyboard.button.requestGeoLocation('Отправить геолокацию')],
-            [Keyboard.button.callback('Ввести адрес вручную', 'geo:manual')],
         ],
     },
     wheretogo: {
@@ -158,7 +156,6 @@ function buildKeyboard(page: Page) {
 // ХЕЛПЕРЫ
 
 const getUserId = (ctx: Context<Update>): number | undefined => ctx.user?.user_id;
-const getReqId = (ctx: Context<Update>): string | undefined => (ctx as any).requestId;
 
 async function editPage(page: Page, ctx: Context<Update>) {
     await ctx.answerOnCallback({
@@ -168,12 +165,6 @@ async function editPage(page: Page, ctx: Context<Update>) {
 
 const sendPage = (page: Page, ctx: Context<Update>) =>
     ctx.reply(pages[page].text, { attachments: [buildKeyboard(page)] });
-
-// Главное меню новым сообщением
-const sendMainMenu = (ctx: Context<Update>, greeting?: string) =>
-    ctx.reply(greeting ? `${greeting}\n\n${pages.main.text}` : pages.main.text, {
-        attachments: [buildKeyboard('main')],
-    });
 
 // Текст + 'Назад'
 async function textWithBack(ctx: Context<Update>, text: string, backTo: Page) {
@@ -220,7 +211,6 @@ async function showRadius(ctx: Context<Update>) {
 }
 
 // 2GIS
-
 async function searchPlaces(key: RubricKey, loc: Location, radiusM: number): Promise<PlaceInput[]> {
     const url = new URL(`${TWOGIS_BASE}/items`);
     url.searchParams.set('key', TWOGIS_KEY ?? '');
@@ -232,100 +222,23 @@ async function searchPlaces(key: RubricKey, loc: Location, radiusM: number): Pro
     url.searchParams.set('page_size', '10');
     url.searchParams.set('locale', 'ru_RU');
 
-    // Ключ API не попадает в лог
-    const logUrl = new URL(url);
-    logUrl.searchParams.delete('key');
-    logUrl.searchParams.delete('point')
+    const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const data: any = await res.json();
 
-    const startedAt = Date.now();
-    logger.info('2gis.request', {
-        method: 'GET',
-        url: logUrl.toString(),
+    if (data?.meta?.code === 404) return [];
+    if (data?.meta?.code !== 200) {
+        throw new Error(`2GIS: ${data?.meta?.code} ${data?.meta?.error?.message ?? ''}`);
+    }
+
+    return (data.result?.items ?? []).map((i: any) => ({
+        placeId: String(i.id),
+        name: i.name ?? 'Без названия',
+        address: i.address_name ?? null,
         category: key,
-        radiusM,
-    });
-
-    try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-        const elapsedMs = Date.now() - startedAt;
-        const data: any = await res.json();
-
-        logger.info('2gis.response', {
-            status: res.status,
-            apiCode: data?.meta?.code,
-            elapsedMs,
-            category: key,
-            resultCount: data?.result?.items?.length ?? 0,
-        });
-
-        if (data?.meta?.code === 404) return [];
-        if (data?.meta?.code !== 200) {
-            throw new Error(`2GIS: ${data?.meta?.code} ${data?.meta?.error?.message ?? ''}`);
-        }
-
-        return (data.result?.items ?? []).map((i: any) => ({
-            placeId: String(i.id),
-            name: i.name ?? 'Без названия',
-            address: i.address_name ?? null,
-            category: key,
-        }));
-    } catch (err) {
-        logger.error('2gis.error', {
-            ...errorInfo(err),
-            elapsedMs: Date.now() - startedAt,
-            category: key,
-            radiusM,
-        });
-        throw err;
-    }
+    }));
 }
 
-// Геокодирование
-interface GeocodeResult { lat: number; lon: number; name: string }
-
-async function geocode(q: string): Promise<GeocodeResult | undefined> {
-    const url = new URL(`${TWOGIS_BASE}/items/geocode`);
-    url.searchParams.set('key', TWOGIS_KEY ?? '');
-    url.searchParams.set('q', q);
-    url.searchParams.set('fields', 'items.point');
-    url.searchParams.set('locale', 'ru_RU');
-
-    const startedAt = Date.now();
-    logger.info('2gis.geocode.request', { method: 'GET', queryLength: q.length });
-
-    try {
-        const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
-        const data: any = await res.json();
-
-        logger.info('2gis.geocode.response', {
-            status: res.status,
-            apiCode: data?.meta?.code,
-            elapsedMs: Date.now() - startedAt,
-            resultCount: data?.result?.items?.length ?? 0,
-        });
-
-        if (data?.meta?.code === 404) return undefined;
-        if (data?.meta?.code !== 200) {
-            throw new Error(`2GIS geocode: ${data?.meta?.code} ${data?.meta?.error?.message ?? ''}`);
-        }
-
-        const item = data.result?.items?.[0];
-        if (!item?.point) return undefined;
-        return {
-            lat: item.point.lat,
-            lon: item.point.lon,
-            name: item.full_name ?? item.address_name ?? item.name ?? q,
-        };
-    } catch (err) {
-        logger.error('2gis.geocode.error', {
-            ...errorInfo(err),
-            elapsedMs: Date.now() - startedAt,
-        });
-        throw err;
-    }
-}
-
-// Очередь найденных мест на пользователя (в памяти, потеря при рестарте не страшна)
+// Очередь найденных мест на пользователя (в памяти, потеря при рестарте не страшна).
 // Кнопка «Другое» берёт следующее место из очереди без нового запроса к 2GIS.
 const queues = new Map<number, { key: RubricKey; places: PlaceInput[] }>();
 
@@ -334,6 +247,9 @@ async function nextPlace(uid: number, key: RubricKey, loc: Location): Promise<Pl
     if (!q || q.key !== key || q.places.length === 0) {
         const known = getKnownPlaceIds(uid);
         const found = await searchPlaces(key, loc, getRadius(uid));
+        const filtered = found.filter(
+            (p) => !known.has(p.placeId)
+        );
         q = { key, places: found.filter((p) => !known.has(p.placeId)) };
         queues.set(uid, q);
     }
@@ -342,107 +258,28 @@ async function nextPlace(uid: number, key: RubricKey, loc: Location): Promise<Pl
 
 // БОТ
 const bot = new Bot(process.env.BOT_TOKEN || '');
-logger.info('bot.initializing', {
-    hasBotToken: Boolean(process.env.BOT_TOKEN),
-    hasTwoGisKey: Boolean(TWOGIS_KEY),
-});
-
-void bot.api.setMyCommands([{
+bot.api.setMyCommands([{
     name: 'start',
-    description: 'Начать работу бота',
-}]).catch((err) => logger.error('bot.commands.error', errorInfo(err)));
+    description: 'Начать работу бота'
+}]);
 
-// Единая точка логирования и обработки ошибок для всех апдейтов.
+bot.on('bot_started', (ctx) => sendPage('main', ctx));
+bot.command('start', (ctx) => sendPage('main', ctx));
+
+// Регистрация/обновление пользователя при любом апдейте
 bot.use(async (ctx, next) => {
-    const requestId = getRequestId();
     const user: any = ctx.user;
-    const userLogId = getUserLogId(user?.user_id);
-
-    (ctx as any).requestId = requestId;
-
-    logger.info('update.received', {
-        requestId,
-        userId: userLogId,
-        ...summarizeUpdate((ctx as any).update),
-        hasUser: user?.user_id !== undefined,
-    });
-
-    // Логируем исходящие ответы без тела сообщения
-    const context: any = ctx;
-    for (const methodName of ['reply', 'answerOnCallback']) {
-        const original = context[methodName];
-        if (typeof original !== 'function') continue;
-
-        context[methodName] = async (...args: unknown[]) => {
-            const startedAt = Date.now();
-            try {
-                const result = await original.apply(context, args);
-                logger.info('bot.response', {
-                    requestId,
-                    userId: userLogId,
-                    method: methodName,
-                    elapsedMs: Date.now() - startedAt,
-                    ok: true,
-                });
-                return result;
-            } catch (err) {
-                logger.error('bot.response.error', {
-                    requestId,
-                    userId: userLogId,
-                    method: methodName,
-                    elapsedMs: Date.now() - startedAt,
-                    ...errorInfo(err),
-                });
-                throw err;
-            }
-        };
+    if (user?.user_id !== undefined) {
+        upsertUser(user.user_id, { username: user.username, firstName: user.first_name });
     }
-
-    try {
-        // Сохранение пользователя внутри общего try, если база недоступна,
-        if (user?.user_id !== undefined) {
-            try {
-                upsertUser(user.user_id, { firstName: user.first_name });
-            } catch (err) {
-                logger.error('db.upsert_user.error', {
-                    requestId,
-                    userId: userLogId,
-                    ...errorInfo(err),
-                });
-                throw err;
-            }
-        }
-
-        await next();
-        logger.info('update.completed', { requestId, userId: userLogId });
-    } catch (err) {
-        logger.error('update.error', {
-            requestId,
-            userId: userLogId,
-            ...errorInfo(err),
-        });
-
-        try {
-            await context.reply('Произошла внутренняя ошибка. Попробуйте ещё раз позже.');
-        } catch (replyErr) {
-            logger.error('error_response.failed', {
-                requestId,
-                userId: userLogId,
-                ...errorInfo(replyErr),
-            });
-        }
-    }
+    return next();
 });
 
-// Драсьте
+// Приветствие
 const greet = async (ctx: Context<Update>) => {
-    const uid = getUserId(ctx);
-    if (uid !== undefined) awaitingAddress.delete(uid);
-
-    logger.info('greet.sent', { requestId: getReqId(ctx), userId: getUserLogId(uid) });
-
     const name = (ctx.user as any)?.first_name;
-    await sendMainMenu(ctx, name ? `Привет, ${name}!` : 'Привет!');
+    await ctx.reply(name ? `Привет, ${name}!` : 'Привет!');
+    await sendPage('main', ctx);
 };
 
 bot.on('bot_started', greet);
@@ -450,84 +287,24 @@ bot.command('start', greet);
 
 // Навигация
 bot.action(/^nav:(main|wheretogo|leisure|sport|settings|geo)$/, async (ctx) => {
-    const uid = getUserId(ctx);
-    if (uid !== undefined) awaitingAddress.delete(uid);
     await editPage(ctx.match![1] as Page, ctx);
 });
 
-// Ручной ввод адреса
-bot.action('geo:manual', async (ctx) => {
-    const uid = getUserId(ctx);
-    if (uid === undefined) return;
-    awaitingAddress.add(uid);
-    await textWithBack(
-        ctx,
-        'Напишите адрес или город одним сообщением, например: «Москва, Тверская 1».',
-        'geo',
-    );
-});
-
-// Входящие сообщения. Геолокация, адрес текстом или любое другое сообщение
+// Получение геолокации
 bot.on('message_created', async (ctx) => {
-    const message = (ctx as any).message;
+    const attachments: any[] = (ctx as any).message?.body?.attachments ?? [];
+    const loc = attachments.find((a) => a.type === 'location');
+    if (!loc) return;
+
     const uid = getUserId(ctx);
     if (uid === undefined) return;
 
-    // 1) Геолокация через кнопку
-    const attachments: any[] = message?.body?.attachments ?? [];
-    const loc = attachments.find((a) => a.type === 'location');
-
-    if (loc) {
-        awaitingAddress.delete(uid);
-        saveLocation(uid, loc.latitude, loc.longitude);
-        queues.delete(uid);
-        logger.info('geo.received', { requestId: getReqId(ctx), userId: getUserLogId(uid), source: 'button' });
-        await sendPage('wheretogo', ctx);
-        return;
-    }
-
-    const text: string | undefined = message?.body?.text?.trim();
-
-    // /start обрабатывает bot.command
-    if (text && /^\/start(\s|$)/.test(text)) return;
-
-    // 2) Адрес текстом
-    if (awaitingAddress.has(uid) && text) {
-        try {
-            const point = await geocode(text);
-            if (!point) {
-                logger.info('geo.manual.not_found', { requestId: getReqId(ctx), userId: getUserLogId(uid) });
-                await ctx.reply('Не нашёл такой адрес. Попробуйте уточнить, например добавьте город.');
-                return;
-            }
-
-            awaitingAddress.delete(uid);
-            saveLocation(uid, point.lat, point.lon);
-            queues.delete(uid);
-            logger.info('geo.received', { requestId: getReqId(ctx), userId: getUserLogId(uid), source: 'manual' });
-
-            await ctx.reply(`Ищу рядом с: ${point.name}`);
-            await sendPage('wheretogo', ctx);
-        } catch (err) {
-            logger.error('geo.manual.error', {
-                requestId: getReqId(ctx),
-                userId: getUserLogId(uid),
-                ...errorInfo(err),
-            });
-            await ctx.reply('Не удалось определить адрес, попробуйте позже.');
-        }
-        return;
-    }
-
-    // 3) Любое другое текстовое сообщение
-    logger.info('message.unrecognized', {
-        requestId: getReqId(ctx),
-        userId: getUserLogId(uid)
-    });
-    await ctx.reply('Введите корректную команду');
+    saveLocation(uid, loc.latitude, loc.longitude);
+    queues.delete(uid);
+    await sendPage('wheretogo', ctx);
 });
 
-// Категории
+// Категории: показываем по одному месту
 bot.action(/^cat:(\w+)$/, async (ctx) => {
     const uid = getUserId(ctx);
     const location = getFreshLocation(uid);
@@ -568,24 +345,47 @@ bot.action(/^cat:(\w+)$/, async (ctx) => {
             },
         });
     } catch (err) {
-        logger.error('search.error', {
-            requestId: getReqId(ctx),
-            userId: getUserLogId(uid),
-            ...errorInfo(err),
-        });
+        console.error('Ошибка поиска в 2GIS:', err);
         await textWithBack(ctx, 'Не удалось получить места, попробуйте позже.', 'wheretogo');
     }
 });
 
-// «Kilroy was here» button
+// «Я был здесь»
 bot.action(/^visit:([\w-]+)$/, async (ctx) => {
     const uid = getUserId(ctx);
-    const ok = uid !== undefined && markVisitedById(uid, ctx.match![1]);
-    await textWithBack(
-        ctx,
-        ok ? 'Отмечено! Место появится в «Посещенных местах».' : 'Не удалось найти это место.',
-        'wheretogo',
-    );
+    const placeId = ctx.match![1];
+
+    if (uid === undefined) {
+        return textWithBack(ctx, 'Не удалось определить пользователя.', 'wheretogo');
+    }
+
+    const ok = markVisitedById(uid, placeId);
+
+    if (!ok) {
+        return textWithBack(ctx, 'Не удалось найти это место.', 'wheretogo');
+    }
+
+    await ctx.answerOnCallback({
+        message: {
+            text: 'Место отмечено как посещённое.\n\nОцените его от 1 до 5:',
+            attachments: [
+                Keyboard.inlineKeyboard([
+                    [
+                        Keyboard.button.callback('⭐ 1', `rate:${placeId}:1`),
+                        Keyboard.button.callback('⭐ 2', `rate:${placeId}:2`),
+                        Keyboard.button.callback('⭐ 3', `rate:${placeId}:3`),
+                    ],
+                    [
+                        Keyboard.button.callback('⭐ 4', `rate:${placeId}:4`),
+                        Keyboard.button.callback('⭐ 5', `rate:${placeId}:5`),
+                    ],
+                    [
+                        Keyboard.button.callback('Пропустить', 'nav:wheretogo'),
+                    ],
+                ]),
+            ],
+        },
+    });
 });
 
 // Посещённые места
@@ -601,7 +401,7 @@ bot.action('visited_places', async (ctx) => {
 
     await textWithBack(ctx, text, 'main');
 });
-
+ 
 // Очистка истории посещённых мест
 bot.action('clear_visited_places', async (ctx) => {
     const uid = getUserId(ctx);
@@ -623,6 +423,50 @@ bot.action(/^radius:(\d+)$/, async (ctx) => {
 });
 
 bot.start().catch((err) => {
-    logger.error('bot.start.error', errorInfo(err));
+    console.error('Не удалось запустить бота:', err);
     process.exit(1);
 });
+
+// Обработка оценок
+bot.action(/^rate:([\w-]+):([1-5])$/, async (ctx) => {
+    const uid = getUserId(ctx);
+
+    if (uid === undefined) {
+        return textWithBack(ctx, 'Не удалось определить пользователя.', 'wheretogo');
+    }
+
+    const placeId = ctx.match![1];
+    const rating = Number(ctx.match![2]);
+
+    const ok = setPlaceRating(uid, placeId, rating);
+
+    await textWithBack(
+        ctx,
+        ok
+            ? `Оценка сохранена: ${rating}/5 ⭐`
+            : 'Не удалось сохранить оценку.',
+        'wheretogo',
+    );
+});
+
+function sortByPreferences(
+    uid: number,
+    places: PlaceInput[]
+): PlaceInput[] {
+    const ratings = getCategoryRatings(uid);
+
+    if (ratings.length === 0) {
+        return places;
+    }
+
+    const ratingMap = new Map(
+        ratings.map((r) => [r.category, r.avg_rating])
+    );
+
+    return [...places].sort((a, b) => {
+        const ratingA = ratingMap.get(a.category ?? '') ?? 0;
+        const ratingB = ratingMap.get(b.category ?? '') ?? 0;
+
+        return ratingB - ratingA;
+    });
+}
